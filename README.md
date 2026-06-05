@@ -49,3 +49,81 @@
 Жанри вигідніше зберігати як окремі вузли, бо жанр — це спільна сутність для багатьох фільмів. Якщо зберігати жанри списком у властивості `Movie`, то для пошуку фільмів певного жанру або для аналізу популярності жанрів доведеться працювати з властивостями. У графовій моделі з вузлами `Genre` такі операції стають обходами графа: `(Movie)-[:HAS_GENRE]->(Genre)`.
 
 Окремі жанрові вузли також корисні для рекомендацій і аналітики. Наприклад, можна знайти улюблені жанри користувача, порівняти жанрові профілі різних користувачів або аналізувати спільноти за жанровими вподобаннями. Крім того, така схема уникає дублювання текстових значень жанрів у багатьох фільмах і робить модель більш нормалізованою.
+
+## Частина 2 — Завантаження даних
+
+### Підготовка CSV-файлів
+
+Файли `movies.dat`, `users.dat` і `ratings.dat` лежать у директорії `import/`. Вони були конвертовані в CSV з кодуванням UTF-8 за допомогою `convert.py`. Скрипт читає початкові файли в кодуванні `latin-1`, розділяє рядки за `::` і створює файли `movies.csv`, `users.csv`, `ratings.csv` у тій самій директорії `import`
+
+Для `users.csv` збережено поля `userId`, `gender`, `age`, `occupation`
+
+Конвертація `.dat` у `.csv`:
+
+```sh
+uv run convert.py
+```
+
+Результат:
+
+```text
+PS C:\Homework\horbokon_nosql_3> uv run convert.py
+Converted movies.dat, ratings.dat, users.dat to CSV files in import folder.
+3883 movies
+1000209 ratings
+6040 users
+```
+
+### Індекси та обмеження
+
+У `queries/part2_load.cypher` створені унікальні обмеження:
+
+```cypher
+CREATE CONSTRAINT user_id IF NOT EXISTS
+FOR (u:User)
+REQUIRE u.userId IS UNIQUE;
+
+CREATE CONSTRAINT movie_id IF NOT EXISTS
+FOR (m:Movie)
+REQUIRE m.movieId IS UNIQUE;
+
+CREATE CONSTRAINT genre_name IF NOT EXISTS
+FOR (g:Genre)
+REQUIRE g.name IS UNIQUE;
+```
+
+Вони одночасно гарантують відсутність дублів і створюють індекси для швидкого пошуку вузлів за ключовими властивостями. Це важливо перед завантаженням ребер `RATED`, бо для кожного рядка з `ratings.csv` Neo4j має швидко знайти відповідного користувача та фільм.
+
+### Завантаження вузлів
+
+Користувачі та фільми завантажуються через `LOAD CSV WITH HEADERS`. Для створення вузлів використовується `MERGE`, а не `CREATE`, щоб повторний запуск скрипта не створював дублікати.
+
+Для фільмів рік виділяється з назви, наприклад з `Toy Story (1995)` береться `1995`. Жанри розбиваються через `split(row.genres, '|')`, після чого для кожного жанру створюється або знаходиться вузол `Genre` і зв'язок `(:Movie)-[:HAS_GENRE]->(:Genre)`.
+
+### Завантаження оцінок
+
+Оцінки завантажуються як ребра `(:User)-[:RATED]->(:Movie)` із властивостями `rating` і `timestamp`. Оскільки у файлі понад мільйон оцінок, завантаження виконується через `apoc.periodic.iterate` з `batchSize: 10000`. Це розбиває роботу на менші транзакції та зменшує ризик таймаутів або проблем із пам'яттю.
+
+### Результати
+
+```
+PS C:\Homework\horbokon_nosql_3> ./execute.ps1 /queries/part2_load.cypher
+usersUpserted
+6040
+moviesUpserted
+3883
+genresUpserted, movieGenresUpserted
+18, 6408
+total, committedOperations, failedOperations
+1000209, 1000209, 0
+users
+6040
+movies
+3883
+genres
+18
+ratings
+1000209
+movieGenreLinks
+6408
+```

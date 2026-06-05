@@ -16,6 +16,7 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
       - ./import:/var/lib/neo4j/import
+      - ./queries:/queries:ro
 
 volumes:
   neo4j_data:
