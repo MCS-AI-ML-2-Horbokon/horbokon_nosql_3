@@ -515,3 +515,217 @@ genre, moviesCount
 Для цього датасету я б застосував стратегію обмеження обходів і попередньої агрегації. Для популярних фільмів варто уникати необмежених запитів через усіх користувачів, які їх оцінили. У рекомендаційних запитах краще додавати фільтри за рейтингом, мінімальною або максимальною кількістю спільних фільмів, а також `LIMIT` на проміжних етапах. Для часто потрібних метрик можна зберігати агреговані властивості, наприклад `ratingsCount` або `averageRating` на вузлі `Movie`, щоб не перераховувати їх щоразу.
 
 Жанрові вузли теж є супервузлами, особливо `Drama` і `Comedy`. Якщо запити часто працюють з жанрами, можна додати проміжну деталізацію: наприклад, розбивати жанровий аналіз за роками випуску, десятиліттями або додатковими категоріями. Інший практичний варіант — дублювати прості жанрові ознаки в властивостях фільму для фільтрації, але залишити вузли `Genre` для графових обходів. Так ми зменшуємо кількість дорогих обходів через великі жанрові вузли, але не втрачаємо переваги графової моделі.
+
+## Частина 5 — Графові алгоритми через GDS
+
+Файл із запитами: `queries/part5_gds.cypher`.
+
+Команда запуску:
+
+```sh
+./execute.ps1 /queries/part5_gds.cypher
+```
+
+### 5.1. PageRank на графі фільмів
+
+Скрипт:
+
+```cypher
+MATCH (m1:Movie)<-[r1:RATED]-(u:User)-[r2:RATED]->(m2:Movie)
+WHERE r1.rating >= 4 AND r2.rating >= 4 AND id(m1) < id(m2)
+WITH m1, m2, count(u) AS weight
+WHERE size([(m1)<-[:RATED]-() | 1]) > 20
+  AND size([(m2)<-[:RATED]-() | 1]) > 20
+WITH m1, m2, weight
+ORDER BY weight DESC
+LIMIT 50000
+MERGE (m1)-[co:CO_RATED]-(m2)
+SET co.weight = weight
+RETURN count(co) AS coRatedRelationshipsCreated;
+
+CALL gds.graph.project(
+  'movieGraph',
+  'Movie',
+  { CO_RATED: { orientation: 'UNDIRECTED', properties: 'weight' } }
+)
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount;
+
+CALL gds.pageRank.stream('movieGraph', {
+  relationshipWeightProperty: 'weight',
+  maxIterations: 20,
+  dampingFactor: 0.85
+})
+YIELD nodeId, score
+WITH gds.util.asNode(nodeId) AS movie, score
+RETURN movie.movieId AS movieId,
+       movie.title AS title,
+       round(score, 4) AS pageRankScore
+ORDER BY score DESC
+LIMIT 10;
+```
+
+Результат:
+
+![Візуалізація CO_RATED графа](screenshots/CO_RATED.png)
+
+```text
+coRatedRelationshipsCreated
+50000
+graphName, nodeCount, relationshipCount
+"movieGraph", 3883, 100000
+movieId, title, pageRankScore
+2858, "American Beauty (1999)", 9.6588
+260, "Star Wars: Episode IV - A New Hope (1977)", 9.1363
+1196, "Star Wars: Episode V - The Empire Strikes Back (1980)", 9.1005
+1198, "Raiders of the Lost Ark (1981)", 7.9385
+608, "Fargo (1996)", 7.0317
+593, "Silence of the Lambs, The (1991)", 6.7142
+858, "Godfather, The (1972)", 6.314
+318, "Shawshank Redemption, The (1994)", 6.2948
+2571, "Matrix, The (1999)", 6.2876
+2762, "Sixth Sense, The (1999)", 6.2459
+```
+
+У цьому графі вузлами є фільми, а ребро `CO_RATED` означає, що багато користувачів високо оцінили обидва фільми. Вага ребра — кількість таких спільних користувачів. PageRank показує, які фільми є центральними в мережі спільних високих оцінок.
+
+Високий PageRank тут означає не просто популярність фільму. Це означає, що фільм часто пов'язаний з іншими важливими фільмами через спільних користувачів. Наприклад, `American Beauty`, `Star Wars`, `Raiders of the Lost Ark` і `Fargo` не лише мають багато оцінок, а й часто входять у набори фільмів, які одні й ті самі користувачі оцінили високо.
+
+### 5.2. Виявлення спільнот Louvain
+
+Скрипт:
+
+```cypher
+MATCH (u1:User)-[r1:RATED]->(m:Movie)<-[r2:RATED]-(u2:User)
+WHERE r1.rating = 5 AND r2.rating = 5 AND id(u1) < id(u2)
+WITH u1, u2, count(m) AS weight
+WITH u1, u2, weight
+ORDER BY weight DESC
+LIMIT 50000
+MERGE (u1)-[sim:SIMILAR]-(u2)
+SET sim.weight = weight,
+    sim.cost = 1.0 / weight
+RETURN count(sim) AS similarRelationshipsCreated;
+
+MATCH (u:User)-[:SIMILAR]-()
+SET u:SimilarUser
+RETURN count(DISTINCT u) AS usersInSimilarityGraph;
+
+CALL gds.graph.project(
+  'userSimilarity',
+  'SimilarUser',
+  { SIMILAR: { orientation: 'UNDIRECTED', properties: ['weight', 'cost'] } }
+)
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount;
+
+CALL gds.louvain.write('userSimilarity', {
+  relationshipWeightProperty: 'weight',
+  writeProperty: 'communityId'
+})
+YIELD communityCount, modularity, modularities
+RETURN communityCount, round(modularity, 4) AS modularity;
+
+MATCH (u:User)
+WHERE u.communityId IS NOT NULL
+RETURN u.communityId AS communityId,
+       count(u) AS usersCount
+ORDER BY usersCount DESC
+LIMIT 10;
+
+MATCH (u:User)
+WHERE u.communityId IS NOT NULL
+WITH u.communityId AS communityId, count(u) AS usersCount
+ORDER BY usersCount DESC
+LIMIT 5
+MATCH (:User {communityId: communityId})-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating >= 4
+WITH communityId, usersCount, g.name AS genre, count(*) AS genreLikes
+ORDER BY communityId, genreLikes DESC
+WITH communityId, usersCount, collect({genre: genre, likes: genreLikes})[0..3] AS topGenres
+RETURN communityId, usersCount, topGenres
+ORDER BY usersCount DESC;
+```
+
+Результат:
+
+![Візуалізація SIMILAR графа](screenshots/SIMILAR.png)
+
+```text
+similarRelationshipsCreated
+50000
+usersInSimilarityGraph
+1470
+graphName, nodeCount, relationshipCount
+"userSimilarity", 1470, 100000
+communityCount, modularity
+4, 0.1676
+communityId, usersCount
+1033, 709
+1010, 360
+695, 300
+784, 101
+communityId, usersCount, topGenres
+1033, 709, [{genre: "Drama", likes: 52657}, {genre: "Comedy", likes: 42894}, {genre: "Action", likes: 29757}]
+1010, 360, [{genre: "Drama", likes: 40072}, {genre: "Comedy", likes: 28027}, {genre: "Romance", likes: 13464}]
+695, 300, [{genre: "Comedy", likes: 28259}, {genre: "Action", likes: 25258}, {genre: "Drama", likes: 24859}]
+784, 101, [{genre: "Drama", likes: 14672}, {genre: "Comedy", likes: 11780}, {genre: "Action", likes: 6248}]
+```
+
+Для Louvain побудовано граф схожості користувачів: два користувачі з'єднуються, якщо вони поставили `5` одним і тим самим фільмам. Вага ребра — кількість таких спільних максимально оцінених фільмів. Використання `rating = 5` залишає тільки найсильніші сигнали схожості й робить граф достатньо компактним для локального запуску.
+
+До GDS-проєкції включені тільки користувачі, які мають хоча б одне ребро `SIMILAR`. Для цього їм тимчасово додається лейбл `SimilarUser`, і саме цей лейбл проєктується в GDS. Ізольовані користувачі не допомагають аналізу спільнот: Louvain неминуче перетворює кожного такого користувача на окрему спільноту з однієї людини, що засмічує результат і не дає корисної інформації про групові смаки.
+
+Після виключення ізольованих користувачів у граф схожості потрапило `1470` користувачів. Алгоритм знайшов `4` спільноти з розмірами `709`, `360`, `300` і `101`. Modularity `0.1676` невисока, тобто кластери існують, але вони не дуже різко відділені один від одного. Це очікувано для MovieLens: багато популярних фільмів подобаються різним групам користувачів, тому межі між смаками розмиті.
+
+Чи відповідають кластери інтуїтивним групам? Частково так. Це видно за топ-жанрами: одна велика спільнота має `Drama`, `Comedy`, `Action`; інша — `Drama`, `Comedy`, `Romance`; ще одна — `Comedy`, `Action`, `Drama`. Тобто це не чисті групи на кшталт тільки «любителі бойовиків» або тільки «поціновувачі драм», але жанрові пріоритети між кластерами трохи відрізняються.
+
+Я перевірив це через агрегацію жанрів фільмів, які користувачі з кожної спільноти оцінили високо (`rating >= 4`). Якщо в різних спільнотах у топі з'являються різні жанри або різний порядок жанрів, це означає, що Louvain виявив певні відмінності у смаках.
+
+### 5.3. Найкоротший шлях між користувачами через Dijkstra
+
+Скрипт:
+
+```cypher
+CALL gds.graph.project(
+  'userGraph',
+  'SimilarUser',
+  { SIMILAR: { orientation: 'UNDIRECTED', properties: ['weight', 'cost'] } }
+)
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount;
+
+MATCH (source:User {userId: 4169}), (target:User {userId: 1680})
+CALL gds.shortestPath.dijkstra.stream('userGraph', {
+  sourceNode: id(source),
+  targetNode: id(target),
+  relationshipWeightProperty: 'cost'
+})
+YIELD totalCost, nodeIds, costs
+RETURN source.userId AS sourceUserId,
+       target.userId AS targetUserId,
+       round(totalCost, 4) AS totalCost,
+       size(nodeIds) - 1 AS pathLength,
+       [nodeId IN nodeIds | gds.util.asNode(nodeId).userId] AS pathUsers;
+```
+
+Такий самий запит було виконано для трьох пар користувачів: `4169 -> 1680`, `4277 -> 1941`, `4169 -> 4277`.
+
+Результат:
+
+```text
+graphName, nodeCount, relationshipCount
+"userGraph", 1470, 100000
+sourceUserId, targetUserId, totalCost, pathLength, pathUsers
+4169, 1680, 0.0098, 1, [4169, 1680]
+sourceUserId, targetUserId, totalCost, pathLength, pathUsers
+4277, 1941, 0.0139, 1, [4277, 1941]
+sourceUserId, targetUserId, totalCost, pathLength, pathUsers
+4169, 4277, 0.0048, 1, [4169, 4277]
+```
+
+Для Dijkstra використано той самий граф схожості користувачів. Оскільки Dijkstra мінімізує вагу, а більша схожість має означати коротшу відстань, для ребра додано властивість `cost = 1.0 / weight`. Тобто користувачі з більшою кількістю спільних п'ятизіркових фільмів мають меншу вартість переходу.
+
+У трьох перевірених парах шлях має довжину `1`, тобто ці користувачі напряму пов'язані ребром `SIMILAR`. Середня довжина для цих трьох прикладів дорівнює `1`. Це показує, що серед активних користувачів зі спільними максимальними оцінками світ дуже «тісний». Для менш активних або ізольованих користувачів шлях може бути довшим або взагалі відсутнім у цій спроєктованій підмножині графа.
+
+Гіпотеза «шести рукостискань» для активної частини цього графа підтверджується: перевірені користувачі пов'язані навіть за один крок. Але це не доводить гіпотезу для всіх користувачів MovieLens, бо ми свідомо аналізували тільки користувачів із хоча б одним зв'язком `SIMILAR`. Частина менш активних користувачів не потрапила до цієї проєкції, тому для них шлях може бути довшим або відсутнім у графі схожості.
